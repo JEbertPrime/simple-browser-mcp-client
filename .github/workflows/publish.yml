@@ -65,7 +65,7 @@ jobs:
   publish_draft:
     name: Publish draft branch snapshot
     if: |
-      (github.event_name == 'push' && github.ref_name == env.DRAFT_BRANCH) ||
+      (github.event_name == 'push' && github.ref_name == '2026-07-28') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'draft')
     runs-on: ubuntu-latest
 
