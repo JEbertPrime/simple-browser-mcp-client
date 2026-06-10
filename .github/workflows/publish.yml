@@ -1,25 +1,42 @@
-name: Publish to GitHub Packages
+name: Publish to npm
 
 on:
   release:
-    # Trigger only on published releases (not drafts/prereleases unless you want them).
     types: [published]
 
-  # Allow manual runs from the Actions tab for testing.
+  push:
+    branches:
+      - 2026-07-28
+
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry-run (pack but do not publish)"
+        description: "Dry-run only (pack but do not publish)"
         type: boolean
         default: false
+      publish_target:
+        description: "Manual target"
+        type: choice
+        options:
+          - stable
+          - draft
+        default: draft
 
 permissions:
   contents: read
-  packages: write # required to push to GitHub Packages
+  id-token: write
+
+env:
+  NODE_VERSION: "22"
+  DRAFT_BRANCH: "2026-07-28"
+  DRAFT_DIST_TAG: "draft-2026-07-28"
 
 jobs:
-  publish:
-    name: Build & publish
+  publish_stable:
+    name: Publish stable release
+    if: |
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'stable')
     runs-on: ubuntu-latest
 
     steps:
@@ -29,10 +46,8 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          registry-url: "https://npm.pkg.github.com"
-          # Scopes the auth token to the GitHub Packages registry.
-          scope: "@JEbertPrime"
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
         run: npm ci
@@ -43,8 +58,42 @@ jobs:
       - name: Pack (dry-run inspection)
         run: npm pack --dry-run
 
-      - name: Publish
+      - name: Publish stable package
         if: ${{ !inputs.dry_run }}
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --access public --provenance
+
+  publish_draft:
+    name: Publish draft branch snapshot
+    if: |
+      (github.event_name == 'push' && github.ref_name == env.DRAFT_BRANCH) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'draft')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build library
+        run: npm run build:lib
+
+      - name: Set unique draft version
+        run: |
+          base_version=$(node -p "require('./package.json').version")
+          draft_version="${base_version}-draft.${{ github.run_number }}"
+          npm version --no-git-tag-version "$draft_version"
+
+      - name: Pack (dry-run inspection)
+        run: npm pack --dry-run
+
+      - name: Publish draft package
+        if: ${{ !inputs.dry_run }}
+        run: npm publish --access public --provenance --tag "${{ env.DRAFT_DIST_TAG }}"
