@@ -61,8 +61,6 @@ jobs:
       - name: Publish stable package
         if: ${{ !inputs.dry_run }}
         run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish_draft:
     name: Publish draft branch snapshot
@@ -99,5 +97,3 @@ jobs:
       - name: Publish draft package
         if: ${{ !inputs.dry_run }}
         run: npm publish --access public --provenance --tag "${{ env.DRAFT_DIST_TAG }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
