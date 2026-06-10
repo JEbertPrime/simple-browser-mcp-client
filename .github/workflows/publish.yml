@@ -28,7 +28,6 @@ permissions:
 
 env:
   NODE_VERSION: "22"
-  DRAFT_BRANCH: "2026-07-28"
   DRAFT_DIST_TAG: "draft-2026-07-28"
 
 jobs:
@@ -65,7 +64,7 @@ jobs:
   publish_draft:
     name: Publish draft branch snapshot
     if: |
-      (github.event_name == 'push' && github.ref_name == env.DRAFT_BRANCH) ||
+      (github.event_name == 'push' && github.ref_name == '2026-07-28') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'draft')
     runs-on: ubuntu-latest
 
