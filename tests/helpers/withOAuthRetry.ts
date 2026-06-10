@@ -71,6 +71,8 @@ export const withOAuthRetry = (
       {
         client_name: clientName,
         redirect_uris: ["http://localhost:3000/callback"],
+        application_type: "native",
+        grant_types: ["authorization_code", "refresh_token"],
       },
       clientMetadataUrl,
     );

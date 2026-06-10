@@ -6,6 +6,12 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/client";
 
+type ConformanceOAuthClientMetadata = OAuthClientMetadata & {
+  application_type?: "native" | "web";
+  grant_types?: string[];
+  scope?: string;
+};
+
 export class ConformanceOAuthProvider implements OAuthClientProvider {
   private _clientInformation?: OAuthClientInformationFull;
   private _tokens?: OAuthTokens;
@@ -15,7 +21,7 @@ export class ConformanceOAuthProvider implements OAuthClientProvider {
 
   constructor(
     private readonly _redirectUrl: string | URL,
-    private readonly _clientMetadata: OAuthClientMetadata,
+    private readonly _clientMetadata: ConformanceOAuthClientMetadata,
     private readonly _clientMetadataUrl?: string | URL,
   ) {}
 
@@ -23,7 +29,7 @@ export class ConformanceOAuthProvider implements OAuthClientProvider {
     return this._redirectUrl;
   }
 
-  get clientMetadata(): OAuthClientMetadata {
+  get clientMetadata(): ConformanceOAuthClientMetadata {
     return this._clientMetadata;
   }
 

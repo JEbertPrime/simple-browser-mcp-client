@@ -1,8 +1,8 @@
 # simple-browser-mcp-client
 
-A zero-dependency MCP client for the browser, implementing the **2025-11-25** version of the [Model Context Protocol](https://modelcontextprotocol.io) specification.
+A zero-dependency MCP client for the browser, targeting the **2026-07-28** draft version of the [Model Context Protocol](https://modelcontextprotocol.io) by default while retaining compatibility paths for older MCP lifecycles.
 
-- **Transport**: Streamable HTTP (POST + GET SSE), with automatic fallback to the legacy 2024-11-05 HTTP+SSE transport
+- **Transport**: Draft stateless Streamable HTTP with `server/discover` and `subscriptions/listen`, plus legacy fallback paths for older servers
 - **No Node.js APIs** — runs anywhere `fetch` and `EventTarget` are available (browsers, Deno, Cloudflare Workers, Bun)
 - Ships ESM (`dist/mcp-client.js`), CJS (`dist/mcp-client.cjs`) and full TypeScript types (`dist/mcp-client.d.ts`)
 
@@ -49,8 +49,10 @@ Pass these to `new MCPClient(options)`:
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `endpoint` | `string` | — | **Required.** URL of the MCP server's single HTTP endpoint. |
-| `clientName` | `string` | `"minimal-mcp-client"` | Name sent in `initialize`. |
-| `clientVersion` | `string` | `"1.0.0"` | Version sent in `initialize`. |
+| `fetchFn` | `(input, init?) => Promise<Response>` | global `fetch` | Override fetch for auth, testing, or custom transport concerns. |
+| `protocolVersion` | `string` | `"2026-07-28"` | MCP protocol version to speak. Passing `"draft"` normalizes to `2026-07-28`. Older versions use the legacy lifecycle path. |
+| `clientName` | `string` | `"minimal-mcp-client"` | Client implementation name sent in per-request `_meta` for draft mode and `initialize` for legacy mode. |
+| `clientVersion` | `string` | `"1.0.0"` | Client implementation version sent in per-request `_meta` for draft mode and `initialize` for legacy mode. |
 | `initialRoots` | `Root[]` | `[]` | Filesystem roots exposed to the server immediately after connecting. URIs must use `file://`. |
 | `onSamplingRequest` | `SamplingHandler` | — | Handle `sampling/createMessage` requests from the server. Declaring this automatically enables the `sampling` capability. |
 | `onElicitationRequest` | `ElicitationHandler` | — | Handle `elicitation/create` requests (form and URL modes). Enables the `elicitation` capability. |
@@ -64,6 +66,14 @@ Pass these to `new MCPClient(options)`:
 
 ## Connection lifecycle
 
+By default, `connect()` uses the draft stateless lifecycle:
+
+- calls `server/discover`
+- sends client identity and capabilities in each request `_meta`
+- opens a `subscriptions/listen` stream when server notifications are supported
+
+If you pass an older `protocolVersion`, the client falls back to the legacy stateful `initialize` / `notifications/initialized` flow.
+
 ```ts
 // Connect — resolves with ServerInfo ({ name, version, title?, description? })
 const info = await client.connect();
@@ -73,7 +83,7 @@ client.connected         // boolean
 client.serverInfo        // ServerInfo | null
 client.serverCapabilities // ServerCapabilities
 
-// Server's usage instructions (from the initialize response)
+// Server's usage instructions (from server/discover in draft mode)
 const instructions = client.getInstructions();
 
 // Disconnect (or use close() — they're the same)
@@ -136,6 +146,8 @@ const { contents } = await client.readResource({ uri: 'config://app' });
 const { resourceTemplates } = await client.listResourceTemplates();
 
 // Subscribe / unsubscribe to change notifications
+// Draft mode uses subscriptions/listen under the hood.
+// Older protocol versions use resources/subscribe and resources/unsubscribe.
 await client.subscribeResource({ uri: 'config://app' });
 client.setNotificationHandler('notifications/resources/updated', async ({ params }) => {
   const p = params as { uri: string };
@@ -186,6 +198,10 @@ client.setNotificationHandler('notifications/message', ({ params }) => {
 client.setNotificationHandler('notifications/tools/list_changed', async () => {
   const { tools } = await client.listTools();
   console.log('Tools updated:', tools.length);
+});
+
+client.setNotificationHandler('notifications/subscriptions/acknowledged', ({ params }) => {
+  console.log('Subscribed to:', params);
 });
 ```
 
@@ -241,6 +257,8 @@ await client.sendRootsListChanged();
 ## Logging
 
 ```ts
+// Legacy helper retained for older protocol versions.
+// Draft MCP prefers per-request io.modelcontextprotocol/logLevel metadata.
 await client.setLoggingLevel('warning');
 // Severity order (low → high):
 // debug | info | notice | warning | error | critical | alert | emergency
@@ -251,7 +269,8 @@ await client.setLoggingLevel('warning');
 ## Ping / keepalive
 
 ```ts
-// One-shot ping — returns round-trip latency in ms
+// One-shot ping — returns round-trip latency in ms.
+// Retained for older/compatibility scenarios; deprecated in the 2026-07-28 draft.
 const rtt = await client.ping();
 
 // Automatic keepalive
@@ -326,6 +345,19 @@ The client extends `EventTarget`. All event `detail` values are typed:
 | `tasks` (experimental) | `{ list: {}, cancel: {}, requests: { … } }` — when sampling or elicitation is active |
 
 Base-protocol utilities (no capability flag required): **ping**, **cancellation**, **progress**.
+
+---
+
+## Conformance
+
+The test client in `tests/client.ts` accepts the conformance runner's `MCP_CONFORMANCE_PROTOCOL_VERSION` override and normalizes the published CLI's `draft` alias to `2026-07-28`.
+
+```sh
+npx @modelcontextprotocol/conformance client \
+  --command "npx tsx --tsconfig tsconfig.test.json tests/client.ts" \
+  --suite draft \
+  --spec-version draft
+```
 
 ---
 

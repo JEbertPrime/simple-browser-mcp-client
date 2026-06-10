@@ -1,6 +1,6 @@
 /**
  * Minimal MCP Client – Web
- * Specification: 2025-11-25
+ * Specification: 2026-07-28
  *
  * Implemented capabilities
  * ────────────────────────
@@ -22,7 +22,17 @@
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PROTOCOL_VERSION = "2025-11-25";
+const PROTOCOL_VERSION = "2026-07-28";
+
+const META_PROTOCOL_VERSION_KEY = "io.modelcontextprotocol/protocolVersion";
+const META_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo";
+const META_CLIENT_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities";
+
+function normalizeProtocolVersion(protocolVersion?: string): string {
+  return protocolVersion === undefined || protocolVersion === "draft"
+    ? PROTOCOL_VERSION
+    : protocolVersion;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // JSON-RPC 2.0 primitives
@@ -367,6 +377,10 @@ export interface TaskRequestOptions extends RequestOptions {
 export interface MCPClientOptions {
   /** URL of the MCP server's single HTTP endpoint. */
   endpoint: string;
+  /** Override fetch for auth, testing, or custom transport concerns. */
+  fetchFn?: (input: string | URL, init?: RequestInit) => Promise<Response>;
+  /** MCP protocol version to speak. Defaults to the current draft target. */
+  protocolVersion?: string;
   clientName?: string;
   clientVersion?: string;
   /** Roots to expose immediately after connecting. */
@@ -430,6 +444,9 @@ interface PendingRequest {
   /** Progress token associated with this request, for cleanup and timeout reset. */
   progressToken?: string | number;
 }
+
+type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
 interface SSEEvent {
   data: string;
   id?: string;
@@ -446,6 +463,17 @@ interface ClientTask extends Task {
   }>;
 }
 
+interface InputRequestEnvelope {
+  method: string;
+  params?: unknown;
+}
+
+interface InputRequiredResultEnvelope {
+  resultType: "input_required";
+  inputRequests?: Record<string, InputRequestEnvelope>;
+  requestState?: string;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MCPClient
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,6 +481,8 @@ interface ClientTask extends Task {
 export class MCPClient extends EventTarget {
   // Config
   private readonly endpoint: string;
+  private readonly fetchFn: FetchLike;
+  private readonly protocolVersion: string;
   private readonly clientName: string;
   private readonly clientVersion: string;
   private readonly defaultTimeoutMs: number;
@@ -483,6 +513,7 @@ export class MCPClient extends EventTarget {
 
   // SSE listen stream
   private listenAbort: AbortController | null = null;
+  private resourceSubscriptions = new Set<string>();
 
   // Keepalive
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -518,6 +549,9 @@ export class MCPClient extends EventTarget {
   constructor(options: MCPClientOptions) {
     super();
     this.endpoint = options.endpoint;
+    this.fetchFn = options.fetchFn ?? fetch;
+    this.protocolVersion = normalizeProtocolVersion(options.protocolVersion);
+    this.negotiatedVersion = this.protocolVersion;
     this.clientName = options.clientName ?? "minimal-mcp-client";
     this.clientVersion = options.clientVersion ?? "1.0.0";
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? 30_000;
@@ -579,9 +613,19 @@ export class MCPClient extends EventTarget {
 
   async connect(): Promise<ServerInfo> {
     if (this._connected) throw new Error("Already connected");
-    await this.initialize();
     this._connected = true;
-    this.startListenStream();
+    try {
+      if (this.usesStatelessLifecycle()) {
+        await this.discoverServer();
+        this.startSubscriptionStream();
+      } else {
+        await this.initialize();
+        this.startListenStream();
+      }
+    } catch (error) {
+      this._connected = false;
+      throw error;
+    }
     if (this.pingIntervalMs > 0) this.startPingKeepAlive();
     return this._serverInfo!;
   }
@@ -595,10 +639,10 @@ export class MCPClient extends EventTarget {
     this.listenAbort?.abort();
     this.listenAbort = null;
 
-    if (this.sessionId) {
+    if (this.sessionId && !this.usesStatelessLifecycle()) {
       // § Session Management: send DELETE to terminate the session.
       try {
-        await fetch(this.endpoint, {
+        await this.fetchFn(this.endpoint, {
           method: "DELETE",
           headers: this.sessionHeaders(),
         });
@@ -654,15 +698,7 @@ export class MCPClient extends EventTarget {
     const id = this.nextId++;
 
     // § Progress: inject progressToken into _meta if provided.
-    let resolvedParams: Record<string, unknown> | undefined = params as
-      | Record<string, unknown>
-      | undefined;
-    if (options?.progressToken !== undefined) {
-      resolvedParams = {
-        ...(resolvedParams ?? {}),
-        _meta: { progressToken: options.progressToken },
-      };
-    }
+    const resolvedParams = this.buildRequestParams(params, options);
 
     const message: JSONRPCRequest = {
       jsonrpc: "2.0",
@@ -671,7 +707,7 @@ export class MCPClient extends EventTarget {
       ...(resolvedParams !== undefined && { params: resolvedParams }),
     };
 
-    return new Promise<T>((resolve, reject) => {
+    const result = await new Promise<unknown>((resolve, reject) => {
       const ms = options?.timeoutMs ?? this.defaultTimeoutMs;
       const timeoutId = setTimeout(() => {
         const pr = this.pendingRequests.get(id);
@@ -702,7 +738,16 @@ export class MCPClient extends EventTarget {
       this.postMessage(message)
         .then(async (res) => {
           if (!res.ok) {
-            this.settlePending(id, undefined, new Error(`HTTP ${res.status}`));
+            const errorDetail = await this.readErrorDetail(res);
+            this.settlePending(
+              id,
+              undefined,
+              new Error(
+                errorDetail
+                  ? `HTTP ${res.status}: ${errorDetail}`
+                  : `HTTP ${res.status}`,
+              ),
+            );
             return;
           }
           const ct = res.headers.get("Content-Type") ?? "";
@@ -720,6 +765,87 @@ export class MCPClient extends EventTarget {
           );
         });
     });
+
+    return this.resolveRequestResult<T>(method, params, options, result);
+  }
+
+  private async resolveRequestResult<T>(
+    method: string,
+    params: unknown,
+    options: RequestOptions | undefined,
+    result: unknown,
+  ): Promise<T> {
+    if (!this.isInputRequiredResult(result)) {
+      return result as T;
+    }
+
+    const retryParams =
+      params && typeof params === "object"
+        ? { ...(params as Record<string, unknown>) }
+        : {};
+    const inputResponses = await this.fulfillInputRequests(
+      result.inputRequests ?? {},
+    );
+
+    if (Object.keys(inputResponses).length > 0) {
+      retryParams.inputResponses = inputResponses;
+    }
+    if (result.requestState !== undefined) {
+      retryParams.requestState = result.requestState;
+    }
+
+    return this.request<T>(method, retryParams, options);
+  }
+
+  private isInputRequiredResult(
+    result: unknown,
+  ): result is InputRequiredResultEnvelope {
+    return (
+      !!result &&
+      typeof result === "object" &&
+      (result as { resultType?: string }).resultType === "input_required"
+    );
+  }
+
+  private async fulfillInputRequests(
+    inputRequests: Record<string, InputRequestEnvelope>,
+  ): Promise<Record<string, unknown>> {
+    const inputResponses: Record<string, unknown> = {};
+
+    for (const [key, request] of Object.entries(inputRequests)) {
+      inputResponses[key] = await this.dispatchServerRequest({
+        jsonrpc: "2.0",
+        id: key,
+        method: request.method,
+        ...(request.params !== undefined && { params: request.params }),
+      });
+    }
+
+    return inputResponses;
+  }
+
+  private async readErrorDetail(res: Response): Promise<string | undefined> {
+    try {
+      const text = await res.text();
+      if (!text) return undefined;
+
+      try {
+        const parsed = JSON.parse(text) as {
+          error?: { message?: string; data?: unknown };
+        };
+        if (parsed.error?.message) {
+          return parsed.error.data !== undefined
+            ? `${parsed.error.message} ${JSON.stringify(parsed.error.data)}`
+            : parsed.error.message;
+        }
+      } catch {
+        return text;
+      }
+
+      return text;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -809,6 +935,45 @@ export class MCPClient extends EventTarget {
     return cap;
   }
 
+  private usesStatelessLifecycle(): boolean {
+    return this.protocolVersion >= "2026-07-28";
+  }
+
+  private buildRequestParams(
+    params?: unknown,
+    options?: RequestOptions,
+  ): Record<string, unknown> | undefined {
+    const baseParams =
+      params && typeof params === "object"
+        ? { ...(params as Record<string, unknown>) }
+        : params === undefined
+          ? undefined
+          : { value: params };
+    const baseMeta =
+      baseParams && "_meta" in baseParams
+        ? ((baseParams._meta as Record<string, unknown> | undefined) ?? {})
+        : {};
+
+    const meta: Record<string, unknown> = {
+      [META_PROTOCOL_VERSION_KEY]: this.protocolVersion,
+      [META_CLIENT_INFO_KEY]: {
+        name: this.clientName,
+        version: this.clientVersion,
+      },
+      [META_CLIENT_CAPABILITIES_KEY]: this.buildCapabilities(),
+      ...baseMeta,
+      ...(options?.progressToken !== undefined && {
+        progressToken: options.progressToken,
+      }),
+    };
+
+    if (!baseParams && Object.keys(meta).length === 0) return undefined;
+    return {
+      ...(baseParams ?? {}),
+      _meta: meta,
+    };
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
   // Initialization
   // ──────────────────────────────────────────────────────────────────────────
@@ -820,13 +985,13 @@ export class MCPClient extends EventTarget {
       id,
       method: "initialize",
       params: {
-        protocolVersion: PROTOCOL_VERSION,
+        protocolVersion: this.protocolVersion,
         capabilities: this.buildCapabilities(),
         clientInfo: { name: this.clientName, version: this.clientVersion },
       },
     };
 
-    let res = await fetch(this.endpoint, {
+    let res = await this.fetchFn(this.endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -857,10 +1022,29 @@ export class MCPClient extends EventTarget {
     await this.postRaw({ jsonrpc: "2.0", method: "notifications/initialized" });
   }
 
+  private async discoverServer(): Promise<void> {
+    const result = await this.request<{
+      supportedVersions: string[];
+      capabilities: ServerCapabilities;
+      serverInfo: ServerInfo;
+      instructions?: string;
+    }>("server/discover", {});
+
+    if (!result.supportedVersions.includes(this.protocolVersion)) {
+      throw new Error(
+        `Server/discover did not advertise requested protocol version ${this.protocolVersion}`,
+      );
+    }
+
+    this._serverCapabilities = result.capabilities ?? {};
+    this._serverInfo = result.serverInfo ?? null;
+    this._instructions = result.instructions ?? null;
+  }
+
   private async probeOldSSETransport(
     initReq: JSONRPCRequest,
   ): Promise<Response> {
-    const res = await fetch(this.endpoint, {
+    const res = await this.fetchFn(this.endpoint, {
       method: "GET",
       headers: { Accept: "text/event-stream" },
     });
@@ -870,7 +1054,7 @@ export class MCPClient extends EventTarget {
       );
 
     const postUrl = await this.readOldEndpointEvent(res.body);
-    return fetch(postUrl, {
+    return this.fetchFn(postUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -956,7 +1140,7 @@ export class MCPClient extends EventTarget {
         };
         if (lastEventId) headers["Last-Event-ID"] = lastEventId;
 
-        const res = await fetch(this.endpoint, {
+        const res = await this.fetchFn(this.endpoint, {
           method: "GET",
           headers,
           signal,
@@ -981,6 +1165,75 @@ export class MCPClient extends EventTarget {
     };
 
     run().catch(console.error);
+  }
+
+  private startSubscriptionStream(): void {
+    const filter = this.buildSubscriptionFilter();
+    const wantsNotifications =
+      filter.toolsListChanged ||
+      filter.promptsListChanged ||
+      filter.resourcesListChanged ||
+      (filter.resourceSubscriptions?.length ?? 0) > 0;
+    if (!wantsNotifications) return;
+
+    this.listenAbort?.abort();
+    this.listenAbort = new AbortController();
+    const signal = this.listenAbort.signal;
+
+    const run = async (): Promise<void> => {
+      try {
+        const message: JSONRPCRequest = {
+          jsonrpc: "2.0",
+          id: this.nextId++,
+          method: "subscriptions/listen",
+          params: this.buildRequestParams({ notifications: filter }),
+        };
+
+        const res = await this.fetchFn(this.endpoint, {
+          method: "POST",
+          headers: this.postHeaders(),
+          body: JSON.stringify(message),
+          signal,
+        });
+        if (!res.ok || !res.body) return;
+
+        await this.drainSSEStream(res.body, signal);
+
+        if (!signal.aborted && this._connected) {
+          await run();
+        }
+      } catch (err) {
+        if ((err as Error).name === "AbortError") return;
+        if (this._connected) {
+          await new Promise((r) => setTimeout(r, 2000));
+          if (!signal.aborted && this._connected) await run();
+        }
+      }
+    };
+
+    run().catch(console.error);
+  }
+
+  private buildSubscriptionFilter(): {
+    toolsListChanged?: boolean;
+    promptsListChanged?: boolean;
+    resourcesListChanged?: boolean;
+    resourceSubscriptions?: string[];
+  } {
+    return {
+      ...(this._serverCapabilities.tools?.listChanged && {
+        toolsListChanged: true,
+      }),
+      ...(this._serverCapabilities.prompts?.listChanged && {
+        promptsListChanged: true,
+      }),
+      ...(this._serverCapabilities.resources?.listChanged && {
+        resourcesListChanged: true,
+      }),
+      ...(this.resourceSubscriptions.size > 0 && {
+        resourceSubscriptions: [...this.resourceSubscriptions],
+      }),
+    };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -1573,12 +1826,12 @@ export class MCPClient extends EventTarget {
 
   /** POST a message and return the raw Response. Handles 404 session-expiry. */
   private async postMessage(msg: JSONRPCMessage): Promise<Response> {
-    const res = await fetch(this.endpoint, {
+    const res = await this.fetchFn(this.endpoint, {
       method: "POST",
       headers: this.postHeaders(),
       body: JSON.stringify(msg),
     });
-    if (res.status === 404 && this.sessionId) {
+    if (res.status === 404 && this.sessionId && !this.usesStatelessLifecycle()) {
       this.sessionId = null;
       this._connected = false;
       this.dispatchEvent(new CustomEvent("session-expired"));
@@ -1776,11 +2029,21 @@ export class MCPClient extends EventTarget {
 
   /** Subscribe to change notifications for a resource URI. */
   subscribeResource(params: { uri: string }): Promise<void> {
+    if (this.usesStatelessLifecycle()) {
+      this.resourceSubscriptions.add(params.uri);
+      if (this._connected) this.startSubscriptionStream();
+      return Promise.resolve();
+    }
     return this.request("resources/subscribe", { uri: params.uri });
   }
 
   /** Unsubscribe from change notifications for a resource URI. */
   unsubscribeResource(params: { uri: string }): Promise<void> {
+    if (this.usesStatelessLifecycle()) {
+      this.resourceSubscriptions.delete(params.uri);
+      if (this._connected) this.startSubscriptionStream();
+      return Promise.resolve();
+    }
     return this.request("resources/unsubscribe", { uri: params.uri });
   }
 
