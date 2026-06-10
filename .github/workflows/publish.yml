@@ -28,6 +28,7 @@ permissions:
 
 env:
   NODE_VERSION: "22"
+  DRAFT_BRANCH: "2026-07-28"
   DRAFT_DIST_TAG: "draft-2026-07-28"
 
 jobs:
